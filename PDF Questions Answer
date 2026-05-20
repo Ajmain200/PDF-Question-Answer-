@@ -1,0 +1,226 @@
+!pip -q install chromadb sentence-transformers transformers pypdf torch
+
+import re
+import torch
+import chromadb
+from google.colab import files
+from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+
+CHUNK_SIZE = 600
+CHUNK_OVERLAP = 120
+TOP_K = 5
+
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+LLM_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+
+print("Loading embedding model...")
+embedder = SentenceTransformer(EMBED_MODEL)
+
+print("Loading LLM...")
+tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL)
+model = AutoModelForCausalLM.from_pretrained(
+    LLM_MODEL,
+    torch_dtype="auto"
+)
+
+generator = pipeline(
+    "text-generation",
+    model=model,
+    tokenizer=tokenizer,
+    device=-1
+)
+
+print("Loading ChromaDB...")
+chroma_client = chromadb.Client()
+collection = chroma_client.get_or_create_collection(
+    name="pdf_collection"
+)
+
+print("READY")
+
+
+def extract_pages(file):
+    reader = PdfReader(file)
+    pages = []
+
+    for i, page in enumerate(reader.pages):
+        text = page.extract_text()
+
+        if text:
+            text = re.sub(r"\s+", " ", text).strip()
+
+            if text:
+                pages.append({
+                    "page": i + 1,
+                    "text": text
+                })
+
+    return pages
+
+
+def chunk_pages(pages):
+    chunks = []
+
+    for p in pages:
+        text = p["text"]
+        page = p["page"]
+
+        start = 0
+
+        while start < len(text):
+            end = start + CHUNK_SIZE
+            chunk = text[start:end]
+
+            chunks.append({
+                "text": chunk,
+                "page": page
+            })
+
+            start += CHUNK_SIZE - CHUNK_OVERLAP
+
+    return chunks
+
+
+def build_index(chunks):
+    global collection
+
+    try:
+        chroma_client.delete_collection("pdf_collection")
+    except:
+        pass
+
+    collection = chroma_client.get_or_create_collection(
+        name="pdf_collection"
+    )
+
+    texts = [c["text"] for c in chunks]
+
+    embeddings = embedder.encode(
+        texts,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        batch_size=32
+    ).tolist()
+
+    ids = [f"chunk_{i}" for i in range(len(chunks))]
+    metadatas = [{"page": c["page"]} for c in chunks]
+
+    collection.add(
+        ids=ids,
+        documents=texts,
+        embeddings=embeddings,
+        metadatas=metadatas
+    )
+
+
+def retrieve(query):
+    query_embedding = embedder.encode(
+        [query],
+        normalize_embeddings=True,
+        convert_to_numpy=True
+    ).tolist()
+
+    results = collection.query(
+        query_embeddings=query_embedding,
+        n_results=TOP_K
+    )
+
+    retrieved = []
+
+    docs = results["documents"][0]
+    metas = results["metadatas"][0]
+
+    for doc, meta in zip(docs, metas):
+        retrieved.append({
+            "text": doc,
+            "page": meta["page"]
+        })
+
+    return retrieved
+
+
+def build_context(chunks):
+    context = ""
+
+    for i, c in enumerate(chunks):
+        context += f"""
+[Source {i+1} | Page {c['page']}]
+{c['text']}
+
+"""
+
+    return context
+
+
+def ask_llm(context, query):
+    prompt = f"""
+You are a strict document-based question answering assistant.
+
+Rules:
+- Answer only from the provided context.
+- Do not invent information.
+- If the answer is not found, say:
+  "I could not find the answer in the uploaded document."
+- Mention page numbers when possible.
+
+Context:
+{context}
+
+Question:
+{query}
+
+Answer:
+"""
+
+    output = generator(
+        prompt,
+        max_new_tokens=300,
+        temperature=0.0,
+        do_sample=False,
+        return_full_text=False
+    )
+
+    return output[0]["generated_text"].strip()
+
+
+def upload_and_index():
+    uploaded = files.upload()
+
+    if not uploaded:
+        return
+
+    pdf_path = list(uploaded.keys())[0]
+
+    print("Reading PDF...")
+    pages = extract_pages(pdf_path)
+
+    print("Chunking...")
+    chunks = chunk_pages(pages)
+
+    print("Building index...")
+    build_index(chunks)
+
+    print("READY")
+
+    return chunks
+
+
+def ask_loop():
+    while True:
+        q = input("\nAsk a question (type 'exit' to quit): ")
+
+        if q.lower() == "exit":
+            break
+
+        retrieved = retrieve(q)
+        context = build_context(retrieved)
+        answer = ask_llm(context, q)
+
+        print("\nAnswer:\n")
+        print(answer)
+
+
+upload_and_index()
+ask_loop()
