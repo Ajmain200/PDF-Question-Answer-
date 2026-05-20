@@ -1,3 +1,5 @@
+#Colab file,run and upload pdf then ask questions
+
 !pip -q install chromadb sentence-transformers transformers pypdf torch
 
 import re
